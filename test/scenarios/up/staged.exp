@@ -1,0 +1,64 @@
+#!/usr/bin/expect -f
+
+# Load common utilities and test functions
+source [file join [file dirname [info script]] "../../lib/common.tcl"]
+source [file join [file dirname [info script]] "../../lib/test_functions.tcl"]
+
+# Get repo path from command line
+if {[llength $argv] < 1} {
+    puts "Usage: $argv0 <repo-path>"
+    exit 1
+}
+
+# Setup paths and change to the repository directory
+set paths [setup_paths [lindex $argv 0]]
+cd [dict get $paths repo_path]
+set bin_path [dict get $paths bin_path]
+set repo_name [dict get $paths repo_name]
+
+puts "\n==== Testing in $repo_name repository ===="
+
+# Test branch creation with staged changes
+spawn $bin_path
+set timeout 20
+expect {
+    -re "Changes to be committed:.*\n.*\n.*modified:.*\n" {
+        test_pass "Listed staged files"
+        exp_continue
+    }
+    -re "Generated branch name:.*\r\n\r\n.*\r\n\r\nUse this branch name\\? \\(Y/n/\\\[e\\\]dit/\\\[r\\\]egenerate\\): " {
+        exp_send "y\r"
+        test_pass "Generated branch name and prompted for confirmation"
+        exp_continue
+    }
+    -re "Generated commit message:.*\r\n\r\n.*\r\n\r\nUse this message\\? \\(Y/n/\\\[e\\\]dit/\\\[r\\\]egenerate\\): " {
+        exp_send "y\r"
+        test_pass "Generated commit message and prompted for confirmation"
+        exp_continue
+    }
+    -exact "Changes committed successfully!" {
+        test_pass "Commit completed successfully"
+        exp_continue
+    }
+    -exact "Warning: No 'origin' remote found. Branch created but not pushed." {
+        test_pass "Handled missing origin"
+        return
+    }
+    -exact "Push branch to origin? (Y/n): " {
+        exp_send "y\r"
+        test_pass "Accepted push"
+        exp_continue
+    }
+    -re "Branch pushed successfully!" {
+        test_pass "Branch pushed successfully"
+        return
+    }
+    timeout {
+        test_fail "Timeout waiting for prompt"
+    }
+    eof {
+        test_fail "Unexpected end of output"
+    }
+}
+
+puts "\n==== All tests for '$repo_name' scenario completed successfully! ====\n" 

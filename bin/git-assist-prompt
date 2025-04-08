@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+
+# Get script directory
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Source common functions
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Function to ensure config directory exists
+ensure_config_dir() {
+    local config_dir="$1"
+    local scenarios=("branch" "commit")
+    
+    mkdir -p "$config_dir"
+    if [ ! -d "$config_dir" ]; then
+        print_message "$RED" "Failed to create config directory: $config_dir"
+        exit 1
+    fi
+    
+    for scenario in "${scenarios[@]}"; do
+        mkdir -p "$config_dir/prompts/$scenario"
+        if [ ! -d "$config_dir/prompts/$scenario" ]; then
+            print_message "$RED" "Failed to create prompts directory: $config_dir/prompts/$scenario"
+            exit 1
+        fi
+    done
+}
+
+# Function to get prompt content preview
+get_preview() {
+    local content="$1"
+    local width="$2"
+    echo "$content" | head -n 1 | cut -c 1-"$width"
+}
+
+# Function to generate descriptive name for prompt
+generate_descriptive_name() {
+    local content="$1"
+    local scenario="$2"
+    
+    # Extract the first line and convert to lowercase
+    local first_line=$(echo "$content" | head -n 1 | tr '[:upper:]' '[:lower:]')
+    
+    # Remove common prefixes and suffixes
+    first_line=$(echo "$first_line" | sed -E 's/^you are a helpful assistant that generates git (branch|commit) (names|messages)//i')
+    first_line=$(echo "$first_line" | sed -E 's/please follow these guidelines://i')
+    
+    # Extract key words
+    local keywords=$(echo "$first_line" | grep -o -E '\b[a-z]+\b' | head -n 2 | tr '\n' '-')
+    keywords=${keywords%-}  # Remove trailing hyphen
+    
+    if [ -z "$keywords" ]; then
+        echo "default"
+    else
+        echo "$keywords"
+    fi
+}
+
+# Function to rename prompt file based on content
+rename_prompt_file() {
+    local file="$1"
+    local scenario="$2"
+    local content="$3"
+    
+    # Get current number and directory
+    local current_name=$(basename "$file")
+    local current_number=$(echo "$current_name" | cut -d'-' -f1)
+    local dir=$(dirname "$file")
+    
+    # Generate new descriptive name
+    local desc_name=$(generate_descriptive_name "$content" "$scenario")
+    
+    # Create new filename
+    local new_name="${current_number}-${scenario}-${desc_name}.md"
+    local new_file="$dir/$new_name"
+    
+    # Only rename if the name has changed
+    if [ "$current_name" != "$new_name" ]; then
+        mv "$file" "$new_file"
+        echo "$new_file"
+    else
+        echo "$file"
+    fi
+}
+
+# Function to list prompts with numbers
+list_prompts_with_numbers() {
+    local config_dir="$1"
+    local scenario="$2"
+    local output_format="$3"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    local counter=1
+    
+    # Get terminal width
+    local term_width=$(tput cols)
+    # Reserve space for number (3) and ellipsis (3)
+    local preview_width=$((term_width - 6))
+    
+    # List prompts for the given scenario
+    local prompts=$(find "$prompts_dir" -name "*.md" | sort)
+    if [ -z "$prompts" ]; then
+        if [ "$output_format" = "json" ]; then
+            echo "[]"
+        else
+            echo "  No ${scenario} prompts configured"
+        fi
+        return 1
+    fi
+    
+    if [ "$output_format" = "json" ]; then
+        echo "["
+        while IFS= read -r file; do
+            local name=$(basename "$file" .md)
+            local content=$(cat "$file")
+            if [ $counter -gt 1 ]; then
+                echo ","
+            fi
+            echo "  {"
+            echo "    \"name\": \"$name\","
+            echo "    \"content\": $(jq -Rs . <<< "$content")"
+            echo -n "  }"
+            counter=$((counter + 1))
+        done <<< "$prompts"
+        echo
+        echo "]"
+    else
+        while IFS= read -r file; do
+            local name=$(basename "$file" .md)
+            local content=$(cat "$file")
+            local preview=$(get_preview "$content" "$preview_width")
+            printf " ${YELLOW}%d.${NC} %s ${GRAY}%s...${NC}\n" "$counter" "$name" "$preview"
+            counter=$((counter + 1))
+        done <<< "$prompts"
+    fi
+    
+    return 0
+}
+
+# Function to get prompt file by number
+get_prompt_file_by_number() {
+    local config_dir="$1"
+    local scenario="$2"
+    local number="$3"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    local file=$(find "$prompts_dir" -name "*.md" | sort | sed -n "${number}p")
+    echo "$file"
+}
+
+# Function to get next available number
+get_next_number() {
+    local config_dir="$1"
+    local scenario="$2"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    local last_number=$(find "$prompts_dir" -name "*.md" | sort | tail -n 1 | sed -E 's/.*\/([0-9]+)-.*/\1/')
+    printf "%02d" $((last_number + 1))
+}
+
+# Function to edit prompt
+edit_prompt() {
+    local config_dir="$1"
+    local scenario="$2"
+    local file="$3"
+    
+    # Save original content for comparison
+    local original_content=$(cat "$file")
+    
+    # Open in editor
+    ${EDITOR:-vim} "$file"
+    
+    # Get new content
+    local new_content=$(cat "$file")
+    
+    # If content changed, rename file
+    if [ "$original_content" != "$new_content" ]; then
+        local new_file=$(rename_prompt_file "$file" "$scenario" "$new_content")
+        if [ "$file" != "$new_file" ]; then
+            print_message "$GREEN" "Prompt updated and renamed successfully!"
+        else
+            print_message "$GREEN" "Prompt updated successfully!"
+        fi
+    else
+        print_message "$GREEN" "Prompt updated successfully!"
+    fi
+}
+
+# Function to renumber prompts
+renumber_prompts() {
+    local config_dir="$1"
+    local scenario="$2"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    # Get all files for the scenario
+    local files=$(find "$prompts_dir" -name "*.md" | sort)
+    local counter=1
+    
+    # Create temporary directory for renaming
+    local temp_dir=$(mktemp -d)
+    
+    # First, move all files to temporary directory with new names
+    while IFS= read -r file; do
+        local current_name=$(basename "$file")
+        local new_number=$(printf "%02d" $counter)
+        local new_name=$(echo "$current_name" | sed -E "s/^[0-9]{2}/${new_number}/")
+        mv "$file" "$temp_dir/$new_name"
+        counter=$((counter + 1))
+    done <<< "$files"
+    
+    # Then, move all files back to prompts directory
+    mv "$temp_dir"/* "$prompts_dir/" 2>/dev/null
+    rmdir "$temp_dir"
+    
+    # Verify the files were moved correctly
+    local moved_files=$(find "$prompts_dir" -name "*.md" | sort)
+    if [ -z "$moved_files" ]; then
+        print_message "$RED" "Error: Failed to renumber prompts"
+        exit 1
+    fi
+}
+
+# Function to delete prompt
+delete_prompt() {
+    local file="$1"
+    local config_dir="$2"
+    local scenario="$3"
+    
+    echo -n "Are you sure you want to delete this prompt? (y/N) "
+    read -r response
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        rm "$file"
+        # Renumber remaining prompts
+        renumber_prompts "$config_dir" "$scenario"
+        print_message "$GREEN" "Prompt deleted successfully!"
+    else
+        print_message "$YELLOW" "Deletion cancelled."
+    fi
+}
+
+# Function to generate target file path
+generate_target_file() {
+    local prompts_dir="$1"
+    local number="$2"
+    local name="$3"
+    echo "$prompts_dir/$(printf "%02d" "$number")-${name}.md"
+}
+
+# Function to add prompt
+add_prompt() {
+    local config_dir="$1"
+    local scenario="$2"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    # List existing prompts
+    echo -e "\n${BLUE}Existing ${scenario} prompts:${NC}"
+    if ! list_prompts_with_numbers "$config_dir" "$scenario"; then
+        echo "  No ${scenario} prompts configured"
+    fi
+    
+    # Get position choice
+    echo -e "\n${BLUE}Where would you like to add the new prompt?${NC}"
+    echo -e " ${MENU_NUMBER}1.${MENU_OPTION} At the beginning"
+    echo -e " ${MENU_NUMBER}2.${MENU_OPTION} After an existing prompt"
+    echo -e " ${MENU_NUMBER}3.${MENU_OPTION} At the end"
+    echo -e " ${MENU_NUMBER}4.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+    
+    read -p "Select an option (1-4): " position_choice
+    
+    case $position_choice in
+        1)
+            # Add at beginning
+            local next_number=1
+            local target_file=$(generate_target_file "$prompts_dir" "$next_number" "custom")
+            ;;
+        2)
+            # Add after existing prompt
+            if ! list_prompts_with_numbers "$config_dir" "$scenario"; then
+                print_message "$RED" "No existing prompts to add after"
+                return
+            fi
+            
+            read -p "Enter the number of the prompt to add after: " after_number
+            local next_number=$((after_number + 1))
+            local target_file=$(generate_target_file "$prompts_dir" "$next_number" "custom")
+            ;;
+        3)
+            # Add at end
+            local last_file=$(find "$prompts_dir" -name "*.md" | sort | tail -n 1)
+            if [ -z "$last_file" ]; then
+                local next_number=1
+            else
+                local last_number=$(basename "$last_file" | cut -d'-' -f1)
+                local next_number=$((last_number + 1))
+            fi
+            local target_file=$(generate_target_file "$prompts_dir" "$next_number" "custom")
+            ;;
+        4)
+            return
+            ;;
+        *)
+            print_message "$RED" "Invalid option"
+            return
+            ;;
+    esac
+    
+    # Create prompts directory if it doesn't exist
+    mkdir -p "$prompts_dir"
+    
+    # Create new prompt file
+    if [ "$position_choice" = "1" ] || [ "$position_choice" = "2" ]; then
+        # Rename existing files to make room
+        for file in $(find "$prompts_dir" -name "*.md" | sort -r); do
+            local number=$(basename "$file" | cut -d'-' -f1)
+            if [ "$number" -ge "$next_number" ]; then
+                local new_number=$(printf "%02d" $((number + 1)))
+                local new_name=$(generate_target_file "$prompts_dir" "$new_number" "$(basename "$file" | cut -d'-' -f2- | sed 's/\.md$//')")
+                mv "$file" "$new_name"
+            fi
+        done
+    fi
+    
+    # Create new prompt file
+    touch "$target_file"
+    
+    # Edit the prompt
+    if ! edit_prompt "$config_dir" "$scenario" "$target_file"; then
+        rm "$target_file"
+        return
+    fi
+    
+    print_message "$GREEN" "Prompt added successfully!"
+}
+
+# Function to move prompt to a new position
+move_prompt() {
+    local file="$1"
+    local config_dir="$2"
+    local scenario="$3"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    # Get current number
+    local current_name=$(basename "$file")
+    local current_number=$(echo "$current_name" | cut -d'-' -f1)
+    local current_desc=$(echo "$current_name" | cut -d'-' -f2- | sed 's/\.md$//')
+    
+    read -p "Enter new position number: " new_number
+    
+    # Validate new position
+    local total_prompts=$(find "$prompts_dir" -name "*.md" | wc -l)
+    if [ "$new_number" -lt 1 ] || [ "$new_number" -gt "$total_prompts" ]; then
+        print_message "$RED" "Invalid position number"
+        return
+    fi
+    
+    # If position hasn't changed, do nothing
+    if [ "$current_number" = "$new_number" ]; then
+        print_message "$YELLOW" "Prompt is already at position $new_number"
+        return
+    fi
+    
+    # Create temporary directory for moving files
+    local temp_dir=$(mktemp -d)
+    
+    # First, move all files to temporary directory
+    for f in $(find "$prompts_dir" -name "*.md" | sort); do
+        mv "$f" "$temp_dir/"
+    done
+    
+    # Then, move files back in new order
+    local counter=1
+    for f in $(find "$temp_dir" -name "*.md" | sort); do
+        local f_name=$(basename "$f")
+        local f_desc=$(echo "$f_name" | cut -d'-' -f2- | sed 's/\.md$//')
+        
+        if [ "$f_name" = "$current_name" ]; then
+            # Place the moved file at the new position
+            local new_file=$(generate_target_file "$prompts_dir" "$new_number" "$current_desc")
+            mv "$f" "$new_file"
+        else
+            # Skip the file being moved
+            if [ "$counter" = "$new_number" ]; then
+                counter=$((counter + 1))
+            fi
+            local new_file=$(generate_target_file "$prompts_dir" "$counter" "$f_desc")
+            mv "$f" "$new_file"
+            counter=$((counter + 1))
+        fi
+    done
+    
+    # Clean up
+    rmdir "$temp_dir"
+    
+    print_message "$GREEN" "Prompt moved successfully!"
+}
+
+# Function to show main menu
+show_main_menu() {
+    local config_dir="$1"
+    local is_top_level=${2:-true}  # Default to true if not specified
+    
+    while true; do
+        echo -e "\n${BLUE}Git Assist Prompt Manager${NC}"
+        echo -e " ${MENU_NUMBER}1.${MENU_OPTION} Manage Branch Name Prompts"
+        echo -e " ${MENU_NUMBER}2.${MENU_OPTION} Manage Commit Message Prompts"
+        if [ "$is_top_level" = "true" ]; then
+            echo -e " ${MENU_NUMBER}3.${MENU_OPTION} ${MENU_EXIT}EXIT${NC}"
+        else
+            echo -e " ${MENU_NUMBER}3.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+        fi
+        
+        read -p "Select an option (1-3): " choice
+        
+        case $choice in
+            1)
+                manage_prompts "$config_dir" "branch"
+                ;;
+            2)
+                manage_prompts "$config_dir" "commit"
+                ;;
+            3)
+                if [ "$is_top_level" = "true" ]; then
+                    exit 0
+                else
+                    return
+                fi
+                ;;
+            *)
+                print_message "$RED" "Invalid option. Please try again."
+                ;;
+        esac
+    done
+}
+
+# Function to check if prompts exist for a scenario
+has_prompts() {
+    local config_dir="$1"
+    local scenario="$2"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    [ -n "$(find "$prompts_dir" -name "*.md" | head -n 1)" ]
+}
+
+# Function to manage prompts for a specific scenario
+manage_prompts() {
+    local config_dir="$1"
+    local scenario="$2"
+    
+    while true; do
+        echo -e "\n${BLUE}${scenario^} Prompts${NC}"
+        if has_prompts "$config_dir" "$scenario"; then
+            list_prompts_with_numbers "$config_dir" "$scenario"
+            echo -e "\n${BLUE}Operations${NC}"
+            echo -e " ${MENU_NUMBER}1.${MENU_OPTION} Add new prompt"
+            echo -e " ${MENU_NUMBER}2.${MENU_OPTION} Edit prompt"
+            echo -e " ${MENU_NUMBER}3.${MENU_OPTION} Move prompt"
+            echo -e " ${MENU_NUMBER}4.${MENU_OPTION} Delete prompt"
+            echo -e " ${MENU_NUMBER}5.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+        else
+            echo "  No ${scenario} prompts configured"
+            echo -e "\n${BLUE}Operations${NC}"
+            echo -e " ${MENU_NUMBER}1.${MENU_OPTION} Add new prompt"
+            echo -e " ${MENU_NUMBER}2.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+        fi
+        
+        read -p "Select an option: " choice
+        
+        case $choice in
+            1)
+                add_prompt "$config_dir" "$scenario"
+                ;;
+            2)
+                if has_prompts "$config_dir" "$scenario"; then
+                    read -p "Enter number to edit: " number
+                    local file=$(get_prompt_file_by_number "$config_dir" "$scenario" "$number")
+                    if [ -n "$file" ]; then
+                        edit_prompt "$config_dir" "$scenario" "$file"
+                    else
+                        print_message "$RED" "Invalid prompt number."
+                    fi
+                else
+                    return
+                fi
+                ;;
+            3)
+                if has_prompts "$config_dir" "$scenario"; then
+                    read -p "Enter number to move: " number
+                    local file=$(get_prompt_file_by_number "$config_dir" "$scenario" "$number")
+                    if [ -n "$file" ]; then
+                        move_prompt "$file" "$config_dir" "$scenario"
+                    else
+                        print_message "$RED" "Invalid prompt number."
+                    fi
+                fi
+                ;;
+            4)
+                if has_prompts "$config_dir" "$scenario"; then
+                    read -p "Enter number to delete: " number
+                    local file=$(get_prompt_file_by_number "$config_dir" "$scenario" "$number")
+                    if [ -n "$file" ]; then
+                        delete_prompt "$file" "$config_dir" "$scenario"
+                    else
+                        print_message "$RED" "Invalid prompt number."
+                    fi
+                fi
+                ;;
+            5)
+                return
+                ;;
+            *)
+                print_message "$RED" "Invalid option. Please try again."
+                ;;
+        esac
+    done
+}
+
+# Function to show help message
+show_help() {
+    printf "%b" "$(cat << EOF
+${BLUE}Git Assist Prompt Manager${NC}
+Manage system prompts for git branch names and commit messages.
+
+${YELLOW}Usage:${NC}
+    git-assist-prompt [options]
+
+${YELLOW}Options:${NC}
+    --help              Show this help message
+    --list [SCENARIO]   List all prompts or prompts for specific scenario (branch or commit)
+    --output json       Output in JSON format (used with --list)
+    --init SCENARIO     Initialize default prompts for a scenario (branch or commit)
+    --config            Enter interactive configuration mode
+    
+${YELLOW}Scenarios:${NC}
+    branch              Branch name prompts
+    commit              Commit message prompts
+
+${YELLOW}Environment Variables:${NC}
+    EDITOR              Editor to use for editing prompts (default: vim)
+    DEBUG               Set to 'true' to show debug messages
+
+For more information, visit: https://github.com/vangie/git-assist
+EOF
+)"
+    exit 0
+}
+
+# Function to validate scenario
+validate_scenario() {
+    local scenario="$1"
+    if [ "$scenario" != "branch" ] && [ "$scenario" != "commit" ]; then
+        print_message "$RED" "Invalid scenario. Must be 'branch' or 'commit'"
+        return 1
+    fi
+    return 0
+}
+
+# Function to initialize prompts
+init_prompts() {
+    local config_dir="$1"
+    local scenario="$2"
+    local prompts_dir="$config_dir/prompts/$scenario"
+    
+    # Create prompts directory if it doesn't exist
+    mkdir -p "$prompts_dir"
+    
+    # Check if prompts already exist
+    if [ -n "$(find "$prompts_dir" -name "*.md")" ]; then
+        debug_message "$YELLOW" "${scenario^} prompts already initialized"
+        return
+    fi
+    
+    # Check and copy template files
+    if [ ! -d "$(dirname "$0")/../prompts/${scenario}" ]; then
+        print_message "$RED" "Template directory not found: $(dirname "$0")/../prompts/${scenario}"
+        exit 1
+    fi
+    
+    if [ -n "$(find "$(dirname "$0")/../prompts/${scenario}" -name "*.md")" ]; then
+        cp "$(dirname "$0")/../prompts/${scenario}"/*.md "$prompts_dir/"
+        debug_message "$GREEN" "${scenario^} prompts initialized"
+    else
+        print_message "$RED" "No template files found in: $(dirname "$0")/../prompts/${scenario}"
+        exit 1
+    fi
+}
+
+# Function to check and initialize prompts
+check_and_init_prompts() {
+    local config_dir="$1"
+    for scenario in branch commit; do
+        init_prompts "$config_dir" "$scenario"
+    done
+}
+
+# Main script
+main() {
+    # Check for yq dependency
+    if ! command -v yq &> /dev/null; then
+        print_message "$RED" "Error: yq is required but not installed"
+        print_message "$CYAN" "Please install yq first:"
+        echo "  macOS: brew install yq"
+        echo "  Linux: sudo apt-get install yq"
+        exit 1
+    fi
+    
+    # Get config directory
+    config_dir=$(get_config_dir)
+    ensure_config_dir "$config_dir"
+    
+    # If no arguments provided, show help
+    if [ $# -eq 0 ]; then
+        show_help
+    fi
+    
+    # Initialize flags
+    local output_format="text"
+    local list_scenario=""
+    local show_help_flag=false
+    local init_scenario=""
+    local config_flag=false
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help)
+                show_help_flag=true
+                shift
+                ;;
+            --output)
+                if [ "$2" = "json" ]; then
+                    output_format="json"
+                    shift 2
+                else
+                    print_message "$RED" "Invalid output format. Only 'json' is supported."
+                    exit 1
+                fi
+                ;;
+            --list)
+                shift
+                # Check if next argument is a valid scenario
+                if [ "$1" = "branch" ] || [ "$1" = "commit" ]; then
+                    list_scenario="$1"
+                    shift
+                fi
+                ;;
+            --init)
+                shift
+                if [ -z "$1" ]; then
+                    # Initialize both scenarios if no scenario specified
+                    init_prompts "$config_dir" "branch"
+                    init_prompts "$config_dir" "commit"
+                    exit 0
+                fi
+                init_scenario="$1"
+                shift
+                ;;
+            --config)
+                config_flag=true
+                shift
+                ;;
+            *)
+                print_message "$RED" "Unknown option: $1"
+                echo "Use --help to see available options"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Process flags after parsing all arguments
+    if [ "$show_help_flag" = true ]; then
+        show_help
+    fi
+    
+    if [ -n "$init_scenario" ]; then
+        init_prompts "$config_dir" "$init_scenario"
+        exit 0
+    fi
+    
+    if [ "$config_flag" = true ]; then
+        check_and_init_prompts "$config_dir"
+        show_main_menu "$config_dir"
+        exit 0
+    fi
+    
+    if [ -n "$list_scenario" ]; then
+        list_prompts_with_numbers "$config_dir" "$list_scenario" "$output_format"
+    else
+        echo -e "\n${BLUE}Branch Name Prompts:${NC}"
+        list_prompts_with_numbers "$config_dir" "branch" "$output_format"
+        echo -e "\n${BLUE}Commit Message Prompts:${NC}"
+        list_prompts_with_numbers "$config_dir" "commit" "$output_format"
+    fi
+}
+
+main "$@" 

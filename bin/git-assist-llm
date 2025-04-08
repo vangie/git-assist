@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+
+# Get script directory
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Source common functions
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Function to get current model configuration
+get_current_model() {
+    local config_dir="$1"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$RED" "No models configured. Please run 'git-assist-config' first."
+        exit 1
+    fi
+    
+    local current_model
+    current_model=$(jq -r '.current // empty' "$keys_file")
+    
+    if [ -z "$current_model" ]; then
+        print_message "$RED" "No model selected. Please run 'git-assist-config' first."
+        exit 1
+    fi
+    
+    echo "$current_model"
+}
+
+# Function to get model configuration
+get_model_config() {
+    local config_dir="$1"
+    local model_id="$2"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$RED" "No models configured. Please run 'git-assist-config' first."
+        exit 1
+    fi
+    
+    if ! jq -e --arg id "$model_id" '.models[$id]' "$keys_file" > /dev/null 2>&1; then
+        print_message "$RED" "Model $model_id not found."
+        exit 1
+    fi
+    
+    local provider
+    provider=$(jq -r --arg id "$model_id" '.models[$id].provider' "$keys_file")
+    
+    case $provider in
+        openai)
+            local api_key
+            if jq -e --arg id "$model_id" '.models[$id].key' "$keys_file" > /dev/null 2>&1; then
+                api_key=$(jq -r --arg id "$model_id" '.models[$id].key' "$keys_file" | base64 -d)
+            else
+                api_key=$(jq -r '.keys.openai' "$keys_file" | base64 -d)
+            fi
+            echo "provider=openai"
+            echo "api_key=$api_key"
+            echo "model=${model_id#openai-}"
+            ;;
+        azure)
+            local api_key
+            local endpoint
+            local deployment
+            api_key=$(jq -r --arg id "$model_id" '.models[$id].key' "$keys_file" | base64 -d)
+            endpoint=$(jq -r --arg id "$model_id" '.models[$id].endpoint' "$keys_file")
+            deployment=$(jq -r --arg id "$model_id" '.models[$id].deployment' "$keys_file")
+            echo "provider=azure"
+            echo "api_key=$api_key"
+            echo "endpoint=$endpoint"
+            echo "deployment=$deployment"
+            ;;
+    esac
+}
+
+# Function to get prompts from git-assist-prompt
+get_prompts() {
+    local config_dir="$1"
+    local type="$2"
+    
+    # Get the absolute path of git-assist-prompt
+    local prompt_script
+    prompt_script="$(dirname "$(readlink -f "$0")")/git-assist-prompt"
+    
+    if [ ! -x "$prompt_script" ]; then
+        print_message "$RED" "git-assist-prompt not found or not executable at $prompt_script"
+        return 1
+    fi
+    
+    # Get prompts from git-assist-prompt in JSON format
+    local prompts_json
+    prompts_json=$("$prompt_script" --list "$type" --output json 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        print_message "$YELLOW" "No ${type} prompts configured"
+        return 1
+    fi
+    
+    # Validate JSON format
+    if ! echo "$prompts_json" | jq empty >/dev/null 2>&1; then
+        print_message "$RED" "Invalid JSON format in prompts"
+        return 1
+    fi
+    
+    # Return the prompts as a JSON array
+    echo "$prompts_json"
+}
+
+# Function to make API request
+make_api_request() {
+    local provider="$1"
+    local api_key="$2"
+    local model="$3"
+    local messages="$4"
+    local endpoint="$5"
+    local deployment="$6"
+    
+    # Clean and validate messages JSON
+    local clean_messages
+    clean_messages=$(echo "$messages" | jq -c . 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        # If jq fails, try to clean the content manually
+        local temp_file
+        temp_file=$(mktemp)
+        echo "$messages" > "$temp_file"
+        clean_messages=$(jq -c . "$temp_file" 2>/dev/null)
+        rm "$temp_file"
+        
+        if [ $? -ne 0 ]; then
+            print_message "$RED" "Invalid messages JSON format"
+            exit 1
+        fi
+    fi
+    
+    # Prepare request payload
+    local request_payload
+    if [ "$provider" = "openai" ]; then
+        request_payload="{
+            \"model\": \"$model\",
+            \"messages\": $clean_messages,
+            \"temperature\": 0
+        }"
+    else
+        request_payload="{
+            \"messages\": $clean_messages
+        }"
+    fi
+    
+    # Debug: Print request payload
+    if [ "$DEBUG" = "true" ]; then
+        echo "Request payload:" >&2
+        echo "$request_payload" | jq . >&2
+    fi
+    
+    local response
+    if [ "$provider" = "openai" ]; then
+        response=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $api_key" \
+            -d "$request_payload")
+    else
+        response=$(curl -s "$endpoint/openai/deployments/$deployment/chat/completions?api-version=2024-03-01-preview" \
+            -H "Content-Type: application/json" \
+            -H "api-key: $api_key" \
+            -d "$request_payload")
+    fi
+    
+    # Debug: Print response
+    if [ "$DEBUG" = "true" ]; then
+        echo "Response:" >&2
+        echo "$response" | jq . >&2
+    fi
+    
+    # Validate response JSON
+    if ! echo "$response" | jq empty >/dev/null 2>&1; then
+        print_message "$RED" "Invalid JSON response from API"
+        exit 1
+    fi
+    
+    # Extract content from response
+    local content
+    content=$(echo "$response" | jq -r '.choices[0].message.content')
+    if [ $? -ne 0 ] || [ "$content" = "null" ]; then
+        print_message "$RED" "Failed to extract content from API response"
+        exit 1
+    fi
+    
+    echo "$content"
+}
+
+# Function to validate scenario type
+validate_scenario() {
+    local type="$1"
+    if [ "$type" != "branch" ] && [ "$type" != "commit" ]; then
+        print_message "$RED" "Invalid scenario type. Must be 'branch' or 'commit'"
+        return 1
+    fi
+    return 0
+}
+
+# Function to show help message
+show_help() {
+    printf "%b" "$(cat << EOF
+${BLUE}Git Assist LLM${NC}
+Use LLM models for various tasks.
+
+${YELLOW}Usage:${NC}
+    git-assist-llm [options] [message]
+
+${YELLOW}Options:${NC}
+    --help              Show this help message
+    --model MODEL_ID    Specify model to use
+    --system PROMPT     Add a system prompt (can be used multiple times)
+    --scenario TYPE     Use prompts from git-assist-prompt as system prompts (TYPE: branch or commit)
+    --list             List available models
+
+${YELLOW}Examples:${NC}
+    git-assist-llm "What is git?"
+    git-assist-llm --model openai-gpt4 "What is git?"
+    git-assist-llm --system "You are a git expert" --system "Be concise" "What is git?"
+    git-assist-llm --scenario branch "Generate a branch name"
+    git-assist-llm --scenario commit "Generate a commit message"
+
+For more information, visit: https://github.com/vangie/git-assist
+EOF
+)"
+    exit 0
+}
+
+# Function to list configured models
+list_models() {
+    local config_dir="$1"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$YELLOW" "No models configured."
+        return 0
+    fi
+    
+    # Check if there are any models configured
+    if ! jq -e '.models | length > 0' "$keys_file" > /dev/null 2>&1; then
+        print_message "$YELLOW" "No models configured yet."
+        return 0
+    fi
+    
+    local current_model
+    current_model=$(jq -r '.current // empty' "$keys_file")
+    
+    jq -r --arg current "$current_model" '
+        .models | to_entries[] | 
+        if .key == $current then "✓ \(.key)" else "  \(.key)" end
+    ' "$keys_file" | while read -r line; do
+        if [[ $line == "✓"* ]]; then
+            print_message "$GREEN" "$line"
+        else
+            echo "$line"
+        fi
+    done
+}
+
+# Main script
+main() {
+    # Check for jq dependency
+    if ! command -v jq &> /dev/null; then
+        print_message "$RED" "Error: jq is required but not installed"
+        print_message "$CYAN" "Please install jq first:"
+        echo "  macOS: brew install jq"
+        echo "  Linux: sudo apt-get install jq"
+        exit 1
+    fi
+    
+    # Get config directory
+    config_dir=$(get_config_dir)
+    
+    # Parse command line arguments
+    local model_id=""
+    local system_prompts=()
+    local message=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help)
+                show_help
+                ;;
+            --model)
+                if [ -z "$2" ]; then
+                    print_message "$RED" "Model ID required for --model"
+                    exit 1
+                fi
+                model_id="$2"
+                shift 2
+                ;;
+            --system)
+                if [ -z "$2" ]; then
+                    print_message "$RED" "Prompt required for --system"
+                    exit 1
+                fi
+                system_prompts+=("$2")
+                shift 2
+                ;;
+            --scenario)
+                if [ -z "$2" ]; then
+                    print_message "$RED" "Type required for --scenario"
+                    exit 1
+                fi
+                local scenario="$2"
+                if ! validate_scenario "$scenario"; then
+                    exit 1
+                fi
+                shift 2
+                # Get prompts from git-assist-prompt
+                local prompts_json
+                prompts_json=$(get_prompts "$config_dir" "$scenario")
+                if [ $? -eq 0 ]; then
+                    # Add each prompt file as a single system message
+                    local num_prompts
+                    num_prompts=$(echo "$prompts_json" | jq 'length')
+                    for ((i=0; i<num_prompts; i++)); do
+                        local prompt
+                        prompt=$(echo "$prompts_json" | jq -r ".[$i].content")
+                        if [ -n "$prompt" ]; then
+                            system_prompts+=("$prompt")
+                        fi
+                    done
+                fi
+                ;;
+            --list)
+                list_models "$config_dir"
+                exit 0
+                ;;
+            *)
+                if [ -z "$message" ]; then
+                    message="$1"
+                else
+                    print_message "$RED" "Unexpected argument: $1"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # If no model specified, use current model
+    if [ -z "$model_id" ]; then
+        model_id=$(get_current_model "$config_dir")
+    fi
+    
+    # Get model configuration
+    local model_config
+    model_config=$(get_model_config "$config_dir" "$model_id")
+    eval "$model_config"
+    
+    # Prepare messages array using jq for proper JSON construction
+    local messages_json='[]'
+    
+    # Add system prompts
+    for prompt in "${system_prompts[@]}"; do
+        messages_json=$(echo "$messages_json" | jq --arg prompt "$prompt" '. + [{"role": "system", "content": $prompt}]')
+    done
+    
+    # Add user message
+    messages_json=$(echo "$messages_json" | jq --arg message "$message" '. + [{"role": "user", "content": $message}]')
+    
+    # Debug: Print messages JSON
+    if [ "$DEBUG" = "true" ]; then
+        echo "Messages JSON:" >&2
+        echo "$messages_json" | jq . >&2
+    fi
+    
+    # Make API request
+    local response
+    response=$(make_api_request "$provider" "$api_key" "$model" "$messages_json" "$endpoint" "$deployment")
+    
+    # Print the response
+    echo "$response"
+}
+
+main "$@"
+   

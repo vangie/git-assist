@@ -1,0 +1,924 @@
+#!/usr/bin/env bash
+
+# Get script directory
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Source common functions
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Function to get config directory
+get_config_dir() {
+    if [ -n "$GIT_ASSIST_HOME" ]; then
+        echo "$GIT_ASSIST_HOME"
+    else
+        echo "$HOME/.config/git-assist"
+    fi
+}
+
+# Function to configure OpenAI key
+configure_openai() {
+    local config_dir="$1"
+    local model_id="$2"
+    local keys_file="$config_dir/models.json"
+    local use_provider_key=true
+    
+    print_message "$BLUE" "\nOpenAI Configuration for $model_id"
+    
+    # Check if OpenAI key exists
+    if jq -e '.keys.openai' "$keys_file" > /dev/null 2>&1; then
+        # Check if model-specific key exists
+        if jq -e --arg id "$model_id" '.models[$id].key' "$keys_file" > /dev/null 2>&1; then
+            # Get and decode keys
+            local model_key
+            model_key=$(jq -r --arg id "$model_id" '.models[$id].key' "$keys_file" | base64 -d)
+            local global_key
+            global_key=$(jq -r '.keys.openai' "$keys_file" | base64 -d)
+            
+            print_message "$CYAN" "A model-specific key already exists. Choose an option:"
+            echo "1. Use existing model-specific key (${model_key:0:4}...${model_key: -4})"
+            echo "2. Override model-specific key"
+            echo "3. Use global key (${global_key:0:4}...${global_key: -4})"
+            echo "4. Override global key"
+            echo -e "\033[90m5. BACK\033[0m"
+            print_message "$CYAN" "Choice (1-5): " -n
+            read -r key_choice
+            
+            case $key_choice in
+                1)
+                    use_provider_key=false
+                    ;;
+                2)
+                    use_provider_key=false
+                    print_message "$CYAN" "New model-specific key (starts with 'sk-'): " -n
+                    read -r openai_key
+                    ;;
+                3)
+                    use_provider_key=true
+                    # Delete model-specific key
+                    local temp_file
+                    temp_file=$(mktemp)
+                    jq --arg id "$model_id" '
+                        if (.models | has($id)) then
+                            .models[$id] = {"provider": "openai"}
+                        else
+                            .models += {($id): {"provider": "openai"}}
+                        end |
+                        .current = $id
+                    ' "$keys_file" > "$temp_file"
+                    mv "$temp_file" "$keys_file"
+                    print_message "$GREEN" "Model-specific key removed, now using global key."
+                    ;;
+                4)
+                    use_provider_key=true
+                    print_message "$CYAN" "New global key (starts with 'sk-'): " -n
+                    read -r openai_key
+                    ;;
+                5)
+                    return 2
+                    ;;
+                *)
+                    print_message "$RED" "Invalid choice"
+                    return 1
+                    ;;
+            esac
+        else
+            # Get and decode global key
+            local global_key
+            global_key=$(jq -r '.keys.openai' "$keys_file" | base64 -d)
+            
+            print_message "$CYAN" "An OpenAI key already exists. Choose an option:"
+            echo "1. Use global key (${global_key:0:4}...${global_key: -4})"
+            echo "2. Override global key"
+            echo "3. Set model-specific key"
+            echo -e "\033[90m4. BACK\033[0m"
+            print_message "$CYAN" "Choice (1-4): " -n
+            read -r key_choice
+            
+            case $key_choice in
+                1)
+                    use_provider_key=true
+                    ;;
+                2)
+                    use_provider_key=true
+                    print_message "$CYAN" "New global key (starts with 'sk-'): " -n
+                    read -r openai_key
+                    ;;
+                3)
+                    use_provider_key=false
+                    print_message "$CYAN" "New model-specific key (starts with 'sk-'): " -n
+                    read -r openai_key
+                    ;;
+                4)
+                    return 2
+                    ;;
+                *)
+                    print_message "$RED" "Invalid choice"
+                    return 1
+                    ;;
+            esac
+        fi
+    else
+        print_message "$CYAN" "No OpenAI key exists. Choose an option:"
+        echo "1. Set global key"
+        echo "2. Set model-specific key"
+        echo -e "\033[90m3. BACK\033[0m"
+        print_message "$CYAN" "Choice (1-3): " -n
+        read -r key_choice
+        
+        case $key_choice in
+            1)
+                use_provider_key=true
+                print_message "$CYAN" "New global key (starts with 'sk-'): " -n
+                read -r openai_key
+                ;;
+            2)
+                use_provider_key=false
+                print_message "$CYAN" "New model-specific key (starts with 'sk-'): " -n
+                read -r openai_key
+                ;;
+            3)
+                return 2
+                ;;
+            *)
+                print_message "$RED" "Invalid choice"
+                return 1
+                ;;
+        esac
+    fi
+    
+    if [ -z "$openai_key" ] && [ "$key_choice" != "1" ]; then
+        print_message "$RED" "API key cannot be empty"
+        return 1
+    fi
+    
+    if [ -n "$openai_key" ] && [[ ! "$openai_key" =~ ^sk- ]]; then
+        print_message "$YELLOW" "Warning: OpenAI API keys typically start with 'sk-'"
+        echo -n "Continue anyway? (y/N) "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    fi
+
+    # Encode key in base64 if provided
+    local encoded_key=""
+    if [ -n "$openai_key" ]; then
+        encoded_key=$(echo -n "$openai_key" | base64)
+    fi
+    
+    # Create or update models.json
+    if [ -f "$keys_file" ]; then
+        # Update existing file
+        local temp_file
+        temp_file=$(mktemp)
+        
+        if [ "$use_provider_key" = true ]; then
+            if [ -n "$openai_key" ]; then
+                # Update provider key and add model without key
+                jq --arg key "$encoded_key" --arg id "$model_id" '
+                    if has("keys") then
+                        .keys.openai = $key
+                    else
+                        . + {"keys": {"openai": $key}}
+                    end |
+                    if (.models | has($id)) then
+                        .models[$id] = {"provider": "openai"}
+                    else
+                        .models += {($id): {"provider": "openai"}}
+                    end |
+                    .current = $id
+                ' "$keys_file" > "$temp_file"
+            else
+                # Just add model without updating key
+                jq --arg id "$model_id" '
+                    if (.models | has($id)) then
+                        .models[$id] = {"provider": "openai"}
+                    else
+                        .models += {($id): {"provider": "openai"}}
+                    end |
+                    .current = $id
+                ' "$keys_file" > "$temp_file"
+            fi
+        else
+            # Add model with custom key
+            jq --arg key "$encoded_key" --arg id "$model_id" '
+                if (.models | has($id)) then
+                    .models[$id] = {"provider": "openai", "key": $key}
+                else
+                    .models += {($id): {"provider": "openai", "key": $key}}
+                end |
+                .current = $id
+            ' "$keys_file" > "$temp_file"
+        fi
+        
+        mv "$temp_file" "$keys_file"
+    else
+        # Create new file
+        if [ "$use_provider_key" = true ]; then
+            echo "{
+                \"keys\": {
+                    \"openai\": \"$encoded_key\"
+                },
+                \"models\": {
+                    \"$model_id\": {
+                        \"provider\": \"openai\"
+                    }
+                },
+                \"current\": \"$model_id\"
+            }" | jq '.' > "$keys_file"
+        else
+            echo "{
+                \"keys\": {},
+                \"models\": {
+                    \"$model_id\": {
+                        \"provider\": \"openai\",
+                        \"key\": \"$encoded_key\"
+                    }
+                },
+                \"current\": \"$model_id\"
+            }" | jq '.' > "$keys_file"
+        fi
+    fi
+    
+    chmod 600 "$keys_file"
+    if [ "$use_provider_key" = true ]; then
+        if [ -n "$openai_key" ]; then
+            print_message "$GREEN" "OpenAI API key configured successfully as provider default!"
+        else
+            print_message "$GREEN" "Using existing OpenAI API key as provider default!"
+        fi
+    else
+        print_message "$GREEN" "OpenAI API key configured successfully as model-specific key!"
+    fi
+    print_message "$GREEN" "Model $model_id is now current."
+    print_message "$CYAN" "Press Enter to continue..."
+    read -r
+    return 0
+}
+
+# Function to configure Azure OpenAI
+configure_azure() {
+    local config_dir="$1"
+    local model_id="$2"
+    local keys_file="$config_dir/models.json"
+    
+    print_message "$BLUE" "\nAzure OpenAI Configuration for $model_id"
+    
+    # Get existing values if any
+    local existing_key=""
+    local existing_endpoint=""
+    local existing_deployment=""
+    
+    if [ -f "$keys_file" ] && jq -e --arg id "$model_id" '.models[$id]' "$keys_file" > /dev/null 2>&1; then
+        existing_key=$(jq -r --arg id "$model_id" '.models[$id].key' "$keys_file" | base64 -d)
+        existing_endpoint=$(jq -r --arg id "$model_id" '.models[$id].endpoint' "$keys_file")
+        existing_deployment=$(jq -r --arg id "$model_id" '.models[$id].deployment' "$keys_file")
+    fi
+    
+    # API Key
+    if [ -n "$existing_key" ]; then
+        print_message "$CYAN" "API key (${existing_key:0:4}...${existing_key: -4}, press Enter to reuse): " -n
+    else
+        print_message "$CYAN" "API key: " -n
+    fi
+    read -r azure_key
+    if [ -z "$azure_key" ] && [ -n "$existing_key" ]; then
+        azure_key="$existing_key"
+    fi
+    
+    # Endpoint URL
+    if [ -n "$existing_endpoint" ]; then
+        print_message "$CYAN" "Endpoint URL ($existing_endpoint, press Enter to reuse): " -n
+    else
+        print_message "$CYAN" "Endpoint URL: " -n
+    fi
+    read -r azure_endpoint
+    if [ -z "$azure_endpoint" ] && [ -n "$existing_endpoint" ]; then
+        azure_endpoint="$existing_endpoint"
+    fi
+    
+    # Deployment name
+    if [ -n "$existing_deployment" ]; then
+        print_message "$CYAN" "Deployment name ($existing_deployment, press Enter to reuse): " -n
+    else
+        print_message "$CYAN" "Deployment name: " -n
+    fi
+    read -r azure_deployment
+    if [ -z "$azure_deployment" ] && [ -n "$existing_deployment" ]; then
+        azure_deployment="$existing_deployment"
+    fi
+    
+    if [ -z "$azure_key" ] || [ -z "$azure_endpoint" ] || [ -z "$azure_deployment" ]; then
+        print_message "$RED" "API key, endpoint URL, and deployment name are all required"
+        return 1
+    fi
+
+    # Encode key in base64
+    local encoded_key
+    encoded_key=$(echo -n "$azure_key" | base64)
+    
+    # Create or update models.json
+    if [ -f "$keys_file" ]; then
+        # Update existing file
+        local temp_file
+        temp_file=$(mktemp)
+        jq --arg id "$model_id" \
+           --arg key "$encoded_key" \
+           --arg endpoint "$azure_endpoint" \
+           --arg deployment "$azure_deployment" '
+            if (.models | has($id)) then
+                .models[$id] = {
+                    "provider": "azure",
+                    "key": $key,
+                    "endpoint": $endpoint,
+                    "deployment": $deployment
+                }
+            else
+                .models += {
+                    ($id): {
+                        "provider": "azure",
+                        "key": $key,
+                        "endpoint": $endpoint,
+                        "deployment": $deployment
+                    }
+                }
+            end |
+            .current = $id |
+            if has("keys") then . else . + {"keys": {}} end
+        ' "$keys_file" > "$temp_file"
+        mv "$temp_file" "$keys_file"
+    else
+        # Create new file
+        echo "{
+            \"keys\": {},
+            \"models\": {
+                \"$model_id\": {
+                    \"provider\": \"azure\",
+                    \"key\": \"$encoded_key\",
+                    \"endpoint\": \"$azure_endpoint\",
+                    \"deployment\": \"$azure_deployment\"
+                }
+            },
+            \"current\": \"$model_id\"
+        }" | jq '.' > "$keys_file"
+    fi
+    
+    chmod 600 "$keys_file"
+    print_message "$GREEN" "Azure OpenAI configuration completed successfully for $model_id!"
+    print_message "$CYAN" "Press Enter to continue..."
+    read -r
+    return 0
+}
+
+# Function to list configured models
+list_models() {
+    local config_dir="$1"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$YELLOW" "No models configured."
+        return 0
+    fi
+    
+    print_message "$BLUE" "\nProvider Keys:"
+    
+    # Show OpenAI provider key status
+    if jq -e '.keys.openai' "$keys_file" > /dev/null 2>&1; then
+        print_message "$CYAN" "OpenAI: Configured"
+    else
+        print_message "$YELLOW" "OpenAI: Not configured"
+    fi
+    
+    print_message "$BLUE" "\nConfigured Models:"
+    
+    # Check if there are any models configured
+    if ! jq -e '.models | length > 0' "$keys_file" > /dev/null 2>&1; then
+        print_message "$YELLOW" "  No models configured yet. Use option 1 to add a new model."
+        return 0
+    fi
+    
+    local current_model
+    current_model=$(jq -r '.current // empty' "$keys_file")
+    
+    jq -r --arg current "$current_model" '
+        .models | to_entries[] | 
+        "\(.key) (\(.value.provider))" + 
+        (if .value.key != null then " [custom key]" else "" end) + 
+        (if .key == $current then " [current]" else "" end)
+    ' "$keys_file" | while read -r line; do
+        if [[ $line == *"[current]"* ]]; then
+            print_message "$GREEN" "✓ $line"
+        else
+            echo "  $line"
+        fi
+    done
+}
+
+# Function to use a specific model
+use_model() {
+    local config_dir="$1"
+    local model_id="$2"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$RED" "No models configured."
+        return 1
+    fi
+    
+    if ! jq -e --arg id "$model_id" '.models[$id]' "$keys_file" > /dev/null 2>&1; then
+        print_message "$RED" "Model $model_id not found."
+        return 1
+    fi
+    
+    local temp_file
+    temp_file=$(mktemp)
+    jq --arg id "$model_id" '.current = $id' "$keys_file" > "$temp_file"
+    mv "$temp_file" "$keys_file"
+    
+    print_message "$GREEN" "Now using model: $model_id"
+}
+
+# Function to delete a model
+delete_model() {
+    local config_dir="$1"
+    local model_id="$2"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$RED" "No models configured."
+        return 1
+    fi
+    
+    if ! jq -e --arg id "$model_id" '.models[$id]' "$keys_file" > /dev/null 2>&1; then
+        print_message "$RED" "Model $model_id not found."
+        return 1
+    fi
+    
+    local current_model
+    current_model=$(jq -r '.current // empty' "$keys_file")
+    
+    local temp_file
+    temp_file=$(mktemp)
+    
+    if [ "$current_model" = "$model_id" ]; then
+        # If deleting current model, remove current field
+        jq --arg id "$model_id" 'del(.models[$id]) | del(.current)' "$keys_file" > "$temp_file"
+    else
+        # Otherwise just delete the model
+        jq --arg id "$model_id" 'del(.models[$id])' "$keys_file" > "$temp_file"
+    fi
+    
+    mv "$temp_file" "$keys_file"
+    print_message "$GREEN" "Model $model_id deleted successfully."
+}
+
+# Function to show help message
+show_help() {
+    printf "%b" "$(cat << EOF
+${BLUE}Git Assist Configuration${NC}
+Configure and manage LLM models for git-assist.
+
+${YELLOW}Usage:${NC}
+    git-assist-config [options]
+
+${YELLOW}Options:${NC}
+    --help              Show this help message
+    --add MODEL_ID      Add or update a model configuration
+    --list             List all configured models
+    --use MODEL_ID     Switch to specified model
+    --delete MODEL_ID  Delete specified model
+    --show             Show current configuration
+
+Model ID format: {provider}-{modelid} (e.g., openai-gpt4, azure-gpt35)
+
+For more information, visit: https://github.com/vangie/git-assist
+EOF
+)"
+    exit 0
+}
+
+# Function to show current configuration
+show_config() {
+    local config_dir="$1"
+    local keys_file="$config_dir/models.json"
+    
+    if [ ! -f "$keys_file" ]; then
+        print_message "$YELLOW" "No configuration found."
+        return 0
+    fi
+    
+    print_message "$BLUE" "\nCurrent Configuration:"
+    
+    # Show OpenAI provider key if exists
+    if jq -e '.keys.openai' "$keys_file" > /dev/null 2>&1; then
+        print_message "$CYAN" "OpenAI Provider API Key: Configured"
+    fi
+    
+    local current_model
+    current_model=$(jq -r '.current // empty' "$keys_file")
+    
+    if [ -n "$current_model" ]; then
+        print_message "$GREEN" "Current model: $current_model"
+        local provider
+        provider=$(jq -r --arg id "$current_model" '.models[$id].provider' "$keys_file")
+        
+        case $provider in
+            openai)
+                print_message "$CYAN" "Provider: OpenAI"
+                if jq -e --arg id "$current_model" '.models[$id].key' "$keys_file" > /dev/null 2>&1; then
+                    print_message "$CYAN" "Using: Model-specific key"
+                else
+                    print_message "$CYAN" "Using: Provider default key"
+                fi
+                ;;
+            azure)
+                print_message "$CYAN" "Provider: Azure OpenAI"
+                print_message "$CYAN" "Endpoint: $(jq -r --arg id "$current_model" '.models[$id].endpoint' "$keys_file")"
+                print_message "$CYAN" "Deployment: $(jq -r --arg id "$current_model" '.models[$id].deployment' "$keys_file")"
+                ;;
+        esac
+    else
+        print_message "$YELLOW" "No model currently selected"
+    fi
+}
+
+# Function to validate model ID format
+validate_model_id() {
+    local model_id="$1"
+    if [[ ! "$model_id" =~ ^(openai|azure)-[a-zA-Z0-9_-]+$ ]]; then
+        print_message "$RED" "Invalid model ID format. Must be {provider}-{modelid} (e.g., openai-gpt4)"
+        return 1
+    fi
+    return 0
+}
+
+# Function to show current model status
+show_current_model() {
+    local config_dir="$1"
+    local keys_file="$config_dir/models.json"
+    
+    if [ -f "$keys_file" ]; then
+        local current_model
+        current_model=$(jq -r '.current // empty' "$keys_file")
+        if [ -n "$current_model" ]; then
+            local provider
+            provider=$(jq -r --arg id "$current_model" '.models[$id].provider' "$keys_file")
+            print_message "$GREEN" "\nCurrent LLM: $current_model ($provider)"
+        else
+            print_message "$YELLOW" "\nNo LLM model currently selected"
+        fi
+    else
+        print_message "$YELLOW" "\nNo LLM models configured yet"
+    fi
+}
+
+# Function to show OpenAI model menu
+show_openai_model_menu() {
+    print_message "$BLUE" "\nSelect OpenAI Model:"
+    echo -e "${MENU_NUMBER}1.${MENU_OPTION} gpt-3.5-turbo (GPT-3.5, cost-effective)"
+    echo -e "${MENU_NUMBER}2.${MENU_OPTION} gpt-4o (GPT-4o, latest)"
+    echo -e "${MENU_NUMBER}3.${MENU_OPTION} gpt-4o-mini (GPT-4 Mini, balanced)"
+    echo -e "${MENU_NUMBER}4.${MENU_OPTION} gpt-4 (GPT-4 Standard, high quality)"
+    echo -e "${MENU_NUMBER}5.${MENU_OPTION} gpt-4-turbo (GPT-4 Turbo, latest)"
+    echo -e "${MENU_NUMBER}6.${MENU_OPTION} Custom model name"
+    echo -e "${MENU_NUMBER}7.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+    print_message "$CYAN" "Choice (1-7): " -n
+}
+
+# Function to show Azure model menu
+show_azure_model_menu() {
+    print_message "$BLUE" "\nSelect Azure OpenAI Model:"
+    echo -e "${MENU_NUMBER}1.${MENU_OPTION} gpt-4o (Latest multimodal model)"
+    echo -e "${MENU_NUMBER}2.${MENU_OPTION} gpt-4o-mini (Balanced multimodal model)"
+    echo -e "${MENU_NUMBER}3.${MENU_OPTION} gpt-4 (Standard high quality)"
+    echo -e "${MENU_NUMBER}4.${MENU_OPTION} gpt-4-turbo (Latest GPT-4)"
+    echo -e "${MENU_NUMBER}5.${MENU_OPTION} gpt-35-turbo (Cost-effective)"
+    echo -e "${MENU_NUMBER}6.${MENU_OPTION} Custom model name"
+    echo -e "${MENU_NUMBER}7.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+    print_message "$CYAN" "Choice (1-7): " -n
+}
+
+# Function to show provider menu
+show_provider_menu() {
+    print_message "$BLUE" "\nSelect LLM Provider:"
+    echo -e "${MENU_NUMBER}1.${MENU_OPTION} OpenAI"
+    echo -e "${MENU_NUMBER}2.${MENU_OPTION} Azure OpenAI"
+    echo -e "${MENU_NUMBER}3.${MENU_OPTION} ${MENU_BACK}BACK${NC}"
+    print_message "$CYAN" "Choice (1-3): " -n
+}
+
+# Function to show main menu
+show_main_menu() {
+    clear
+    print_message "$BLUE" "Git Assist LLM Configuration Wizard"
+    show_current_model "$config_dir"
+    
+    print_message "$CYAN" "\nSelect an action:"
+    echo -e "${MENU_NUMBER}1.${MENU_OPTION} Add new LLM model"
+    echo -e "${MENU_NUMBER}2.${MENU_OPTION} List all configured models"
+    echo -e "${MENU_NUMBER}3.${MENU_OPTION} Set current LLM model"
+    echo -e "${MENU_NUMBER}4.${MENU_OPTION} Delete LLM model"
+    echo -e "${MENU_NUMBER}5.${MENU_OPTION} ${MENU_EXIT}EXIT${NC}"
+    print_message "$CYAN" "Choice (1-5): " -n
+}
+
+# Main script
+main() {
+    # Check for jq dependency
+    if ! command -v jq &> /dev/null; then
+        print_message "$RED" "Error: jq is required but not installed"
+        print_message "$CYAN" "Please install jq first:"
+        echo "  macOS: brew install jq"
+        echo "  Linux: sudo apt-get install jq"
+        exit 1
+    fi
+    
+    # Get config directory
+    config_dir=$(get_config_dir)
+    ensure_config_dir "$config_dir"
+    
+    # If no arguments provided, show help
+    if [ $# -eq 0 ]; then
+        show_help
+    fi
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help)
+                show_help
+                ;;
+            --config)
+                # Run interactive configuration
+                while true; do
+                    show_main_menu
+                    read -r choice
+                    
+                    case $choice in
+                        1)
+                            while true; do
+                                show_provider_menu
+                                read -r provider_choice
+                                
+                                case $provider_choice in
+                                    1)
+                                        while true; do
+                                            show_openai_model_menu
+                                            read -r model_choice
+                                            
+                                            case $model_choice in
+                                                1)
+                                                    model_id="openai-gpt35"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_openai "$config_dir" "$model_id"
+                                                        if [ $? -eq 2 ]; then
+                                                            continue
+                                                        fi
+                                                    fi
+                                                    break 3
+                                                    ;;
+                                                2)
+                                                    model_id="openai-gpt4o"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_openai "$config_dir" "$model_id"
+                                                        if [ $? -eq 2 ]; then
+                                                            continue
+                                                        fi
+                                                    fi
+                                                    break 3
+                                                    ;;
+                                                3)
+                                                    model_id="openai-gpt4o-mini"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_openai "$config_dir" "$model_id"
+                                                        if [ $? -eq 2 ]; then
+                                                            continue
+                                                        fi
+                                                    fi
+                                                    break 3
+                                                    ;;
+                                                4)
+                                                    model_id="openai-gpt4"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_openai "$config_dir" "$model_id"
+                                                        if [ $? -eq 2 ]; then
+                                                            continue
+                                                        fi
+                                                    fi
+                                                    break 3
+                                                    ;;
+                                                5)
+                                                    model_id="openai-gpt4t"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_openai "$config_dir" "$model_id"
+                                                        if [ $? -eq 2 ]; then
+                                                            continue
+                                                        fi
+                                                    fi
+                                                    break 3
+                                                    ;;
+                                                6)
+                                                    print_message "$CYAN" "Enter custom model name (e.g., gpt-4, gpt-35-turbo): " -n
+                                                    read -r model_name
+                                                    model_id="openai-$model_name"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_openai "$config_dir" "$model_id"
+                                                        if [ $? -eq 2 ]; then
+                                                            continue
+                                                        fi
+                                                    fi
+                                                    break 3
+                                                    ;;
+                                                7)
+                                                    break
+                                                    ;;
+                                                *)
+                                                    print_message "$RED" "Invalid selection"
+                                                    ;;
+                                            esac
+                                        done
+                                        ;;
+                                    2)
+                                        while true; do
+                                            show_azure_model_menu
+                                            read -r model_choice
+                                            
+                                            case $model_choice in
+                                                1)
+                                                    model_id="azure-gpt4o"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_azure "$config_dir" "$model_id"
+                                                    fi
+                                                    break 2
+                                                    ;;
+                                                2)
+                                                    model_id="azure-gpt4o-mini"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_azure "$config_dir" "$model_id"
+                                                    fi
+                                                    break 2
+                                                    ;;
+                                                3)
+                                                    model_id="azure-gpt4"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_azure "$config_dir" "$model_id"
+                                                    fi
+                                                    break 2
+                                                    ;;
+                                                4)
+                                                    model_id="azure-gpt4t"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_azure "$config_dir" "$model_id"
+                                                    fi
+                                                    break 2
+                                                    ;;
+                                                5)
+                                                    model_id="azure-gpt35"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_azure "$config_dir" "$model_id"
+                                                    fi
+                                                    break 2
+                                                    ;;
+                                                6)
+                                                    print_message "$CYAN" "Enter custom model name (e.g., gpt-4, gpt-35-turbo): " -n
+                                                    read -r model_name
+                                                    model_id="azure-$model_name"
+                                                    if validate_model_id "$model_id"; then
+                                                        configure_azure "$config_dir" "$model_id"
+                                                    fi
+                                                    break 2
+                                                    ;;
+                                                7)
+                                                    break
+                                                    ;;
+                                                *)
+                                                    print_message "$RED" "Invalid selection"
+                                                    ;;
+                                            esac
+                                        done
+                                        ;;
+                                    3)
+                                        break
+                                        ;;
+                                    *)
+                                        print_message "$RED" "Invalid selection"
+                                        ;;
+                                esac
+                            done
+                            ;;
+                        2)
+                            list_models "$config_dir"
+                            echo
+                            print_message "$CYAN" "Press Enter to continue..."
+                            read -r
+                            ;;
+                        3)
+                            # First check if there are any models configured
+                            if ! jq -e '.models | length > 0' "$config_dir/models.json" > /dev/null 2>&1; then
+                                print_message "$YELLOW" "No models configured yet. Please add a model first."
+                                echo
+                                show_current_model "$config_dir"
+                                print_message "$CYAN" "Press Enter to continue..."
+                                read -r
+                                continue
+                            fi
+                            
+                            # Show available models with numbers
+                            print_message "$BLUE" "\nAvailable LLM models:"
+                            local model_list
+                            model_list=($(jq -r '.models | keys[]' "$config_dir/models.json"))
+                            local current_model
+                            current_model=$(jq -r '.current // empty' "$config_dir/models.json")
+                            
+                            local i=1
+                            for model in "${model_list[@]}"; do
+                                if [ "$model" = "$current_model" ]; then
+                                    print_message "$GREEN" "$i. $model [current]"
+                                else
+                                    echo "$i. $model"
+                                fi
+                                i=$((i+1))
+                            done
+                            
+                            echo -n "Select model number (1-${#model_list[@]}): "
+                            read -r model_number
+                            
+                            # Validate input
+                            if [[ "$model_number" =~ ^[0-9]+$ ]] && [ "$model_number" -ge 1 ] && [ "$model_number" -le "${#model_list[@]}" ]; then
+                                selected_model="${model_list[$((model_number-1))]}"
+                                use_model "$config_dir" "$selected_model"
+                            else
+                                print_message "$RED" "Invalid selection"
+                            fi
+                            
+                            echo
+                            show_current_model "$config_dir"
+                            print_message "$CYAN" "Press Enter to continue..."
+                            read -r
+                            ;;
+                        4)
+                            # First check if there are any models configured
+                            if ! jq -e '.models | length > 0' "$config_dir/models.json" > /dev/null 2>&1; then
+                                print_message "$YELLOW" "No models configured yet. Please add a model first."
+                                echo
+                                print_message "$CYAN" "Press Enter to continue..."
+                                read -r
+                                continue
+                            fi
+                            
+                            # Show available models with numbers
+                            print_message "$BLUE" "\nAvailable LLM models:"
+                            local model_list
+                            model_list=($(jq -r '.models | keys[]' "$config_dir/models.json"))
+                            local current_model
+                            current_model=$(jq -r '.current // empty' "$config_dir/models.json")
+                            
+                            local i=1
+                            for model in "${model_list[@]}"; do
+                                if [ "$model" = "$current_model" ]; then
+                                    print_message "$GREEN" "$i. $model [current]"
+                                else
+                                    echo "$i. $model"
+                                fi
+                                i=$((i+1))
+                            done
+                            
+                            echo -n "Select model number to delete (1-${#model_list[@]}): "
+                            read -r model_number
+                            
+                            # Validate input
+                            if [[ "$model_number" =~ ^[0-9]+$ ]] && [ "$model_number" -ge 1 ] && [ "$model_number" -le "${#model_list[@]}" ]; then
+                                selected_model="${model_list[$((model_number-1))]}"
+                                delete_model "$config_dir" "$selected_model"
+                            else
+                                print_message "$RED" "Invalid selection"
+                            fi
+                            
+                            echo
+                            print_message "$CYAN" "Press Enter to continue..."
+                            read -r
+                            ;;
+                        5)
+                            exit 0
+                            ;;
+                        *)
+                            print_message "$RED" "Invalid choice"
+                            echo
+                            show_current_model "$config_dir"
+                            print_message "$CYAN" "Press Enter to continue..."
+                            read -r
+                            ;;
+                    esac
+                done
+                ;;
+            *)
+                print_message "$RED" "Unknown option: $1"
+                echo "Use --help to see available options"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+main "$@" 

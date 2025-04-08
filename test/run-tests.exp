@@ -1,0 +1,137 @@
+#!/usr/bin/expect -f
+# Main test runner for git-assist
+
+# Get directories
+set script_dir [file dirname [file normalize $argv0]]
+set scenarios_dir [file join $script_dir "scenarios"]
+set repos_dir [file join $script_dir "repos"]
+
+# Function to run a single test
+proc run_test {scenario_script repo_path} {
+    if {[catch {exec $scenario_script $repo_path} result]} {
+        puts "FAILED: $result"
+        return 0
+    } else {
+        puts $result
+        return 1
+    }
+}
+
+# Function to run tests in a directory
+proc run_directory_tests {dir_path repo_base} {
+    set succeeded 0
+    set failed 0
+    
+    # Find all test files
+    set test_files [glob -nocomplain -directory $dir_path -type f *.exp]
+    if {[llength $test_files] == 0} {
+        puts "No test files found in $dir_path"
+        return [list $succeeded $failed]
+    }
+    
+    foreach test $test_files {
+        set test_name [file rootname [file tail $test]]
+        set repo_path [file join $repo_base $test_name]
+        
+        puts "\n==================================================================="
+        puts "Running test: $test_name"
+        puts "==================================================================="
+        
+        if {[run_test $test $repo_path]} {
+            incr succeeded
+        } else {
+            incr failed
+        }
+    }
+    
+    return [list $succeeded $failed]
+}
+
+# Parse command line arguments
+set mode "all"
+set target ""
+
+if {[llength $argv] > 0} {
+    set arg [lindex $argv 0]
+    switch -glob -- $arg {
+        "gen" {
+            set mode "group"
+            set target "gen"
+        }
+        "up" {
+            set mode "group"
+            set target "up"
+        }
+        "gen-*" {
+            set mode "single"
+            set target [string range $arg 4 end]
+            set group "gen"
+        }
+        "up-*" {
+            set mode "single"
+            set target [string range $arg 3 end]
+            set group "up"
+        }
+        default {
+            puts "Usage: run-tests.exp \[gen|up|gen-<test>|up-<test>\]"
+            puts "Examples:"
+            puts "  run-tests.exp         # Run all tests"
+            puts "  run-tests.exp gen     # Run all git-gen tests"
+            puts "  run-tests.exp up      # Run all git-up tests"
+            puts "  run-tests.exp gen-staged  # Run specific git-gen test"
+            puts "  run-tests.exp up-staged   # Run specific git-up test"
+            exit 1
+        }
+    }
+}
+
+set total_succeeded 0
+set total_failed 0
+
+switch $mode {
+    "all" {
+        puts "Running all tests..."
+        
+        puts "\nRunning git-gen tests..."
+        lassign [run_directory_tests [file join $scenarios_dir "gen"] $repos_dir] succeeded failed
+        incr total_succeeded $succeeded
+        incr total_failed $failed
+        
+        puts "\nRunning git-up tests..."
+        lassign [run_directory_tests [file join $scenarios_dir "up"] $repos_dir] succeeded failed
+        incr total_succeeded $succeeded
+        incr total_failed $failed
+    }
+    "group" {
+        puts "Running $target tests..."
+        lassign [run_directory_tests [file join $scenarios_dir $target] $repos_dir] succeeded failed
+        set total_succeeded $succeeded
+        set total_failed $failed
+    }
+    "single" {
+        set test_file [file join $scenarios_dir $group "$target.exp"]
+        if {[file exists $test_file]} {
+            puts "Running single test: $group/$target"
+            if {[run_test $test_file [file join $repos_dir $target]]} {
+                set total_succeeded 1
+            } else {
+                set total_failed 1
+            }
+        } else {
+            puts "Error: Test file not found: $test_file"
+            exit 1
+        }
+    }
+}
+
+# Summary
+puts "\n==================================================================="
+puts "Test Summary: $total_succeeded succeeded, $total_failed failed"
+puts "==================================================================="
+
+if {$total_failed > 0} {
+    exit 1
+} else {
+    puts "All tests passed!"
+    exit 0
+} 

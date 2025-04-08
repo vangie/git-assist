@@ -1,0 +1,27 @@
+#!/usr/bin/expect -f
+# Test script for amend functionality
+
+# Source common utilities and test functions
+set script_dir [file dirname [file normalize $argv0]]
+source [file join [file dirname [info script]] "../../lib/common.tcl"]
+source [file join [file dirname [info script]] "../../lib/test_functions.tcl"]
+
+# Get repo path from command line
+if {[llength $argv] < 1} {
+    puts "Usage: $argv0 <repo-path>"
+    exit 1
+}
+
+# Setup paths and change to the repository directory
+set paths [setup_paths [lindex $argv 0]]
+cd [dict get $paths repo_path]
+set bin_path [dict get $paths bin_path]
+set repo_name [dict get $paths repo_name]
+
+puts "\n==== Testing in $repo_name repository ===="
+
+# Run tests specific to amend functionality
+section "1. Testing amend functionality"
+test_amend $bin_path
+
+puts "\n==== All tests for '$repo_name' scenario completed successfully! ====\n" 

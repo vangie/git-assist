@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+# Test script for help functionality
+
+# Source common utilities and test functions
+set script_dir [file dirname [file normalize $argv0]]
+source [file join [file dirname [info script]] "../../lib/common.tcl"]
+source [file join [file dirname [info script]] "../../lib/test_functions.tcl"]
+
+# Get repo path from command line
+if {[llength $argv] < 1} {
+    puts "Usage: $argv0 <repo-path>"
+    exit 1
+}
+
+# Setup paths
+set paths [setup_paths [lindex $argv 0]]
+set bin_path [dict get $paths bin_path]
+set repo_name [dict get $paths repo_name]
+
+puts "\n==== Testing help functionality ===="
+
+# Run help test
+test_help $bin_path
+
+puts "\n==== Help functionality test completed successfully! ====\n" 
