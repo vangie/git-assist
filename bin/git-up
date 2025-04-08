@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+
+# Get script directory
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Source common functions
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Check bash version for read command options
+if ((BASH_VERSINFO[0] >= 4)); then
+    HAS_READ_I=true
+else
+    HAS_READ_I=false
+fi
+
+# Function to read with default value
+read_with_default() {
+    local prompt=$1
+    local default=$2
+    local input
+    
+    if [ "$HAS_READ_I" = true ]; then
+        # Use -i option for bash >= 4
+        read -e -p "$prompt" -i "$default" input
+    else
+        # Fallback for older bash versions
+        echo -e "${YELLOW}Current value:${NC} $default"
+        echo -n "$prompt"
+        read -e input
+        input=${input:-$default}
+    fi
+    echo "$input"
+}
+
+# Initialize flags
+DRY_RUN=false
+SHOW_HELP=false
+
+# Function to show help message
+show_help() {
+    printf "%b" "$(cat << EOF
+${BLUE}Git Branch Creator${NC}
+A tool to create and push feature branches with meaningful names using LLM.
+
+${YELLOW}Usage:${NC}
+    git-up [options]
+
+${YELLOW}Options:${NC}
+    --help      Show this help message
+    --dry-run   Show what would be done without making actual changes
+
+${YELLOW}Examples:${NC}
+    # Create a new branch and commit staged changes
+    git-up
+
+    # Show what would be done without making changes
+    git-up --dry-run
+
+${YELLOW}Configuration:${NC}
+    Branch name format template is stored in:
+    ~/.config/git-assist/branch-prompt.txt
+    
+    System prompt template is stored in:
+    ~/.config/git-assist/system-prompt.txt
+
+${YELLOW}Environment Variables:${NC}
+    EDITOR    Editor to use when editing commit messages (default: vim)
+
+For more information, visit: https://github.com/vangie/git-assist
+EOF
+)"
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -h|--help)
+            SHOW_HELP=true
+            shift
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Use --help to see available options"
+            exit 1
+            ;;
+    esac
+done
+
+# Show help if requested
+if [ "$SHOW_HELP" = true ]; then
+    show_help
+fi
+
+# Function to check git repository
+check_git_repo() {
+    if ! git rev-parse --is-inside-work-tree &> /dev/null; then
+        print_message "$RED" "Error: Not a git repository"
+        exit 1
+    fi
+}
+
+# Function to get staged changes
+get_staged_changes() {
+    git diff --cached --name-status
+}
+
+# Function to get all changes
+get_all_changes() {
+    git diff --name-status
+}
+
+# Function to show staged files
+show_staged_files() {
+    echo -e "${CYAN}Changes to be committed:${NC}"
+    echo "  (use \"git restore --staged <file>...\" to unstage)"
+    echo
+    git diff --cached --name-status | while read -r status file; do
+        case "$status" in
+            M) echo -e "        ${CYAN}modified:   $file${NC}" ;;
+            A) echo -e "        ${CYAN}new file:   $file${NC}" ;;
+            D) echo -e "        ${CYAN}deleted:    $file${NC}" ;;
+            R) echo -e "        ${CYAN}renamed:    $file${NC}" ;;
+            C) echo -e "        ${CYAN}copied:     $file${NC}" ;;
+            *) echo -e "        ${CYAN}changed:    $file${NC}" ;;
+        esac
+    done
+    echo
+}
+
+# Function to get username from git config
+get_git_username() {
+    # Get first name only and convert to lowercase
+    local username=$(git config user.name | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+    if [ -z "$username" ]; then
+        username="feature"
+    fi
+    echo "$username"
+}
+
+# Function to get staged changes with content
+get_staged_changes_with_content() {
+    # Get staged changes with content
+    local diff_content
+    diff_content=$(git diff --cached)
+    
+    # Count the number of lines in diff
+    local diff_lines
+    diff_lines=$(echo "$diff_content" | wc -l)
+    
+    # If diff is too large (more than 1000 lines), only show file list
+    if [ "$diff_lines" -gt 1000 ]; then
+        echo "Changes are too large, showing file list only:"
+        git diff --cached --name-status
+        return
+    fi
+    
+    # Show full diff for small changes
+    echo "$diff_content"
+    
+    # Get new files content
+    git diff --cached --name-status | while read -r status file; do
+        if [ "$status" = "A" ]; then
+            # Check file size before showing content
+            local file_size
+            file_size=$(git show ":$file" | wc -l)
+            if [ "$file_size" -gt 100 ]; then
+                echo "New file: $file (content too large to show)"
+            else
+                echo "New file: $file"
+                echo "---"
+                git show ":$file"
+                echo "---"
+            fi
+        fi
+    done
+}
+
+# Function to generate branch name
+generate_branch_name() {
+    local diff_content="$1"
+    local username="$2"
+    local previous_suggestions="$3"
+    
+    # Prepare the prompt
+    local prompt="Generate a branch name for the following changes. The git username is '$username'.
+
+$diff_content
+
+IMPORTANT: You must follow these rules exactly:
+
+1. Your response must be ONLY the branch name, nothing else
+2. Do not include any explanations, descriptions, or additional text
+3. Do not use phrases like 'branch name:', 'suggested name:', etc.
+4. The output must be a single line containing just the branch name
+5. Follow the format: <username>/<type>/<description>
+6. Use kebab-case for all parts
+7. Keep total length under 50 characters
+
+Examples of correct responses:
+$username/feature/add-github-actions
+$username/fix/update-dependencies
+$username/docs/improve-readme
+
+Examples of incorrect responses (DO NOT DO THIS):
+The branch name is $username/feature/add-github-actions
+Suggested name: $username/fix/update-dependencies
+I suggest using $username/docs/improve-readme
+feature/add-github-actions
+fix/update-dependencies
+docs/improve-readme
+
+Your response must match the format of the correct examples exactly."
+    
+    # Add previous suggestions if any
+    if [ -n "$previous_suggestions" ]; then
+        prompt+="\n\nPrevious suggestions:\n$previous_suggestions"
+    fi
+    
+    # Make API request using full path with --scenario branch
+    local response
+    response=$("$SCRIPT_DIR/git-assist-llm" --scenario branch "$prompt")
+    
+    # Extract branch name - remove any non-branch-name text and clean up
+    local branch_name
+    branch_name=$(echo "$response" | sed -E 's/^[[:space:]]*//' | sed -E 's/[[:space:]]*$//' | tr -d '\n' | tr -d '`')
+    
+    # Debug: Print raw response and extracted branch name
+    if [ "$DEBUG" = "true" ]; then
+        echo "Raw response: $response" >&2
+        echo "Extracted branch name: $branch_name" >&2
+    fi
+    
+    # Ensure branch name is not empty
+    if [ -z "$branch_name" ]; then
+        print_message "$RED" "Failed to generate valid branch name"
+        exit 1
+    fi
+    
+    echo "$branch_name"
+}
+
+# Function to generate commit message
+generate_commit_message() {
+    local diff_content="$1"
+    local branch_name="$2"
+    local previous_suggestions="$3"
+    
+    # Prepare the prompt
+    local prompt="Generate a commit message for the following changes. The branch name is '$branch_name'.
+
+$diff_content
+
+IMPORTANT: You must follow these rules exactly:
+
+1. Your response must be ONLY the commit message, nothing else
+2. Do not include any explanations, descriptions, or additional text
+3. Do not use phrases like 'commit message:', 'suggested message:', etc.
+4. The output must be a single line containing just the commit message
+5. Follow the format: :<Emoji>: <Type>: <Subject>
+6. Use present tense for the subject
+7. Keep subject under 72 characters
+8. No dot (.) at the end of the subject
+
+Examples of correct responses:
+:star: feat: add user authentication
+:bug: fix: resolve login timeout issue
+:pencil: docs: update API documentation
+
+Examples of incorrect responses (DO NOT DO THIS):
+The commit message is :star: feat: add user authentication
+Suggested message: :bug: fix: resolve login timeout issue
+I suggest using :pencil: docs: update API documentation
+feat: add user authentication
+fix: resolve login timeout issue
+docs: update API documentation
+
+Your response must match the format of the correct examples exactly."
+    
+    # Add previous suggestions if any
+    if [ -n "$previous_suggestions" ]; then
+        prompt+="\n\nPrevious suggestions:\n$previous_suggestions"
+    fi
+    
+    # Make API request using full path with --scenario commit
+    local response
+    response=$("$SCRIPT_DIR/git-assist-llm" --scenario commit "$prompt")
+    
+    # Extract commit message - remove any non-message text and clean up
+    local commit_message
+    commit_message=$(echo "$response" | sed -E 's/^[[:space:]]*//' | sed -E 's/[[:space:]]*$//' | tr -d '\n' | tr -d '`')
+    
+    # Debug: Print raw response and extracted commit message
+    if [ "$DEBUG" = "true" ]; then
+        echo "Raw response: $response" >&2
+        echo "Extracted commit message: $commit_message" >&2
+    fi
+    
+    # Ensure commit message is not empty
+    if [ -z "$commit_message" ]; then
+        print_message "$RED" "Failed to generate valid commit message"
+        exit 1
+    fi
+    
+    echo "$commit_message"
+}
+
+# Function to edit text in editor
+edit_text() {
+    local text=$1
+    local git_dir=$(git rev-parse --git-dir)
+    local temp_file="$git_dir/EDIT_TEXT"
+    echo "$text" > "$temp_file"
+    
+    # Use /dev/tty to ensure proper terminal interaction
+    ${EDITOR:-vim} "$temp_file" </dev/tty >/dev/tty
+    local status=$?
+    
+    # Check for different exit statuses:
+    # 0 = normal exit
+    # 1 = error exit without writing (:cq)
+    # >1 = other error exits
+    if [ $status -eq 1 ]; then
+        echo "Editing cancelled"
+        return 1
+    elif [ $status -gt 1 ]; then
+        echo "Error occurred while editing"
+        return 1
+    fi
+    
+    # Read the edited text
+    local edited_text=$(cat "$temp_file")
+    if [ -z "$(echo "$edited_text" | tr -d '[:space:]')" ]; then
+        echo "Empty text not allowed"
+        return 1
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[DRY-RUN] Text after editing:${NC}"
+        echo -e "$edited_text"
+    fi
+    
+    echo "$edited_text"
+    return 0
+}
+
+# Function to edit commit message
+edit_commit_message() {
+    local message=$1
+    local git_dir=$(git rev-parse --git-dir)
+    echo "$message" > "$git_dir/COMMIT_EDITMSG"
+    
+    # Use /dev/tty to ensure proper terminal interaction
+    ${EDITOR:-vim} "$git_dir/COMMIT_EDITMSG" </dev/tty >/dev/tty
+    local status=$?
+    
+    if [ $status -ne 0 ]; then
+        echo "Aborting commit due to empty commit message or editor exit"
+        return 1
+    fi
+    
+    # Read the edited message and check if it's empty
+    local edited_message=$(cat "$git_dir/COMMIT_EDITMSG")
+    if [ -z "$(echo "$edited_message" | grep -v '^#' | tr -d '[:space:]')" ]; then
+        echo "Aborting commit due to empty commit message"
+        return 1
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[DRY-RUN] Commit message after editing:${NC}"
+        echo -e "$edited_message"
+    fi
+    
+    echo "$edited_message"
+    return 0
+}
+
+# Function to create and switch to branch
+create_branch() {
+    local branch_name=$1
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[DRY-RUN] git checkout -b ${branch_name}${NC}"
+        return 0
+    fi
+    
+    if ! git checkout -b "$branch_name"; then
+        print_message "$RED" "Failed to create branch: $branch_name"
+        exit 1
+    fi
+}
+
+# Function to commit changes
+commit_changes() {
+    local commit_message=$1
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[DRY-RUN] git commit with message:${NC}"
+        echo -e "${CYAN}$commit_message${NC}"
+        return 0
+    fi
+    
+    if ! git commit -m "$commit_message"; then
+        print_message "$RED" "Failed to commit changes"
+        exit 1
+    fi
+}
+
+# Function to check if origin remote exists
+check_origin_exists() {
+    if ! git remote get-url origin &> /dev/null; then
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "${YELLOW}[DRY-RUN] Warning: No 'origin' remote found${NC}"
+        else
+            echo -e "${YELLOW}Warning: No 'origin' remote found. Branch created but not pushed.${NC}"
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# Function to push branch
+push_branch() {
+    local branch_name=$1
+    
+    # Check if origin exists before attempting to push
+    if ! check_origin_exists; then
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[DRY-RUN] git push -u origin ${branch_name}${NC}"
+        return 0
+    fi
+    
+    if ! git push -u origin "$branch_name"; then
+        print_message "$RED" "Failed to push branch to origin"
+        exit 1
+    fi
+    echo -e "${GREEN}Branch pushed successfully!${NC}"
+}
+
+# Function to edit branch name
+edit_branch_name() {
+    local current_name=$1
+    local new_name
+    
+    while true; do
+        input=$(read_with_default "Branch name: " "$current_name")
+        
+        case "$input" in
+            "")
+                # Keep current name
+                new_name="$current_name"
+                break
+                ;;
+            "e")
+                # Open in editor
+                if edited_name=$(edit_text "$current_name"); then
+                    new_name="$edited_name"
+                    break
+                fi
+                ;;
+            *)
+                new_name="$input"
+                break
+                ;;
+        esac
+    done
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}Would use branch name: ${new_name}${NC}"
+    fi
+    
+    echo "$new_name"
+    return 0
+}
+
+# Function to ensure EDITOR is set
+ensure_editor() {
+    # If EDITOR is not set or is empty, try to find vim
+    if [ -z "${EDITOR:-}" ]; then
+        if command -v vim &> /dev/null; then
+            export EDITOR=vim
+        elif command -v vi &> /dev/null; then
+            export EDITOR=vi
+        else
+            echo -e "${RED}Error: No suitable editor found. Please set EDITOR environment variable.${NC}"
+            exit 1
+        fi
+    fi
+}
+
+# Main script
+main() {
+    check_git_repo
+    ensure_editor
+    
+    # Get git directory path early
+    local git_dir=$(git rev-parse --git-dir)
+    
+    # Check if there are staged changes
+    if [ -z "$(get_staged_changes)" ]; then
+        # First check if there are any unstaged changes before asking to stage them
+        if [ -z "$(get_all_changes)" ] && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            print_message "$RED" "No changes to create branch from"
+            exit 1
+        fi
+        
+        echo -n "No staged changes found. Would you like to stage all changes? (y/N) "
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            if [ "$DRY_RUN" = false ]; then
+                git add .
+            else
+                echo -e "${YELLOW}Would stage all changes${NC}"
+            fi
+            if [ -z "$(get_staged_changes)" ] && [ "$DRY_RUN" = false ]; then
+                print_message "$RED" "No changes to create branch from"
+                exit 1
+            fi
+        else
+            print_message "$RED" "No changes staged for branch creation"
+            exit 1
+        fi
+    fi
+    
+    # Show staged files
+    show_staged_files
+    
+    # Get diff content with new files content
+    local diff_content
+    diff_content=$(get_staged_changes_with_content)
+    
+    # Initialize variables for previous results
+    local previous_branch_names=""
+    local previous_commit_messages=""
+    
+    # Generate branch name
+    local branch_name=""
+    while true; do
+        printf "Generating branch name..."
+        branch_name=$(generate_branch_name "$diff_content" "$(get_git_username)" "$previous_branch_names")
+        printf "\rGenerated branch name:           \n"
+        echo -e "\n${CYAN}    $branch_name${NC}\n"
+        
+        # Ask for confirmation or edit
+        echo -n "Use this branch name? (Y/n/[e]dit/[r]egenerate): "
+        read -r choice
+        
+        case "$choice" in
+            [Nn]*)
+                exit 0
+                ;;
+            [Ee]*)
+                # Run edit_branch_name and redirect output to terminal except the last line
+                branch_name=$(edit_branch_name "$branch_name" | tee /dev/tty | tail -n 1)
+                if [ $? -eq 0 ]; then
+                    break
+                fi
+                ;;
+            [Rr]*)
+                # Append the current branch name to the list of previous names
+                if [ -n "$previous_branch_names" ]; then
+                    previous_branch_names="$previous_branch_names\n$branch_name"
+                else
+                    previous_branch_names="$branch_name"
+                fi
+                continue
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    # Generate commit message
+    local commit_message=""
+    while true; do
+        printf "Generating commit message..."
+        commit_message=$(generate_commit_message "$diff_content" "$branch_name" "$previous_commit_messages")
+        printf "\rGenerated commit message:           \n"
+        echo -e "\n${CYAN}    $commit_message${NC}\n"
+        
+        # Ask for confirmation or edit
+        echo -n "Use this message? (Y/n/[e]dit/[r]egenerate): "
+        read -r choice
+        
+        case "$choice" in
+            [Nn]*)
+                exit 0
+                ;;
+            [Ee]*)
+                edited_message=$(edit_commit_message "$commit_message")
+                if [ $? -eq 0 ]; then
+                    commit_message="$edited_message"
+                    break
+                fi
+                ;;
+            [Rr]*)
+                # Append the current message to the list of previous messages
+                if [ -n "$previous_commit_messages" ]; then
+                    previous_commit_messages="$previous_commit_messages\n$commit_message"
+                else
+                    previous_commit_messages="$commit_message"
+                fi
+                continue
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    # Now perform all git operations
+    create_branch "$branch_name"
+    commit_changes "$commit_message"
+    echo -e "${GREEN}Changes committed successfully!${NC}"
+    
+    # Push branch to origin if it exists
+    push_branch "$branch_name"
+}
+
+# Initialize prompts if needed
+"$SCRIPT_DIR/git-assist-prompt" --init branch
+"$SCRIPT_DIR/git-assist-prompt" --init commit
+
+main 

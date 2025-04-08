@@ -1,0 +1,78 @@
+#!/usr/bin/expect -f
+
+# Load common utilities and test functions
+source [file join [file dirname [info script]] "../../lib/common.tcl"]
+source [file join [file dirname [info script]] "../../lib/test_functions.tcl"]
+
+# Get repo path from command line
+if {[llength $argv] < 1} {
+    puts "Usage: $argv0 <repo-path>"
+    exit 1
+}
+
+# Setup paths and change to the repository directory
+set paths [setup_paths [lindex $argv 0]]
+cd [dict get $paths repo_path]
+set bin_path [dict get $paths bin_path]
+set repo_name [dict get $paths repo_name]
+
+puts "\n==== Testing in $repo_name repository ===="
+
+# Test dry run mode
+spawn $bin_path --dry-run
+set timeout 20
+
+expect {
+    -exact "No staged changes found. Would you like to stage all changes? (y/N) " {
+        exp_send "y\r"
+        test_pass "Staging all changes"
+        exp_continue
+    }
+    -exact "Changes to be committed:" {
+        test_pass "Listed staged files"
+        exp_continue
+    }
+    -re "Generated branch name:.*\r\n\r\n.*\r\n" {
+        test_pass "Generated branch name"
+        exp_continue
+    }
+    -exact "Use this branch name? (Y/n/\[e\]dit/\[r\]egenerate): " {
+        exp_send "y\r"
+        test_pass "Accepted branch name"
+        exp_continue
+    }
+    -re "\\\[DRY-RUN\\\] git checkout -b .*" {
+        test_pass "Dry run branch creation message"
+        exp_continue
+    }
+    -re "Generated commit message:.*\r\n\r\n.*\r\n" {
+        test_pass "Generated commit message"
+        exp_continue
+    }
+    -exact "Use this message? (Y/n/\[e\]dit/\[r\]egenerate): " {
+        exp_send "y\r"
+        test_pass "Accepted commit message"
+        exp_continue
+    }
+    -re "\\\[DRY-RUN\\\] git commit with message:.*" {
+        test_pass "Dry run commit message"
+        exp_continue
+    }
+    -exact "Push branch to origin? (Y/n): " {
+        exp_send "y\r"
+        test_pass "Accepted push"
+        exp_continue
+    }
+    -re "\\\[DRY-RUN\\\] git push -u origin .*" {
+        test_pass "Dry run push message"
+        return
+    }
+    timeout {
+        test_fail "Timeout waiting for prompt"
+    }
+    eof {
+        test_fail "Unexpected end of output"
+    }
+}
+
+puts "\n==== All tests for '$repo_name' scenario completed successfully! ====\n" 

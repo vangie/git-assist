@@ -1,0 +1,30 @@
+#!/usr/bin/expect -f
+# Test script for staged changes scenario
+
+# Source common utilities and test functions
+set script_dir [file dirname [file normalize $argv0]]
+source [file join [file dirname [info script]] "../../lib/common.tcl"]
+source [file join [file dirname [info script]] "../../lib/test_functions.tcl"]
+
+# Get repo path from command line
+if {[llength $argv] < 1} {
+    puts "Usage: $argv0 <repo-path>"
+    exit 1
+}
+
+# Setup paths and change to the repository directory
+set paths [setup_paths [lindex $argv 0]]
+cd [dict get $paths repo_path]
+set bin_path [dict get $paths bin_path]
+set repo_name [dict get $paths repo_name]
+
+puts "\n==== Testing in $repo_name repository ===="
+
+# Run tests specific to staged changes scenario
+section "1. Testing message generation for staged changes"
+test_msg_only $bin_path
+
+section "2. Testing commit with staged changes"
+test_staged_commit $bin_path
+
+puts "\n==== All tests for '$repo_name' scenario completed successfully! ====\n" 

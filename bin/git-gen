@@ -1,0 +1,325 @@
+#!/bin/bash
+
+# Get script directory
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Source common functions
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Initialize flags
+MSG_ONLY=false
+AMEND=false
+SHOW_HELP=false
+
+# Function to show help message
+show_help() {
+    printf "%b" "$(cat << EOF
+${BLUE}Git Commit Message Generator${NC}
+A tool to generate meaningful git commit messages using LLM.
+
+${YELLOW}Usage:${NC}
+    git-gen [options]
+
+${YELLOW}Options:${NC}
+    --help      Show this help message
+    --msg-only  Only generate the commit message without committing
+    --amend     Modify the message of the most recent commit
+
+${YELLOW}Examples:${NC}
+    # Generate and commit with the staged changes
+    git-gen
+
+    # Only show the generated message for staged changes
+    git-gen --msg-only
+
+    # Amend the last commit message
+    git-gen --amend
+
+    # Show what the amended message would be without changing it
+    git-gen --amend --msg-only
+
+${YELLOW}Configuration:${NC}
+    System prompt template is stored in:
+    ~/.config/git-assist/system-prompt.txt
+
+${YELLOW}Environment Variables:${NC}
+    EDITOR    Editor to use when editing commit messages (default: vim)
+
+For more information, visit: https://github.com/vangie/git-assist
+EOF
+)"
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --msg-only)
+            MSG_ONLY=true
+            shift
+            ;;
+        --amend)
+            AMEND=true
+            shift
+            ;;
+        -h|--help)
+            SHOW_HELP=true
+            shift
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Use --help to see available options"
+            exit 1
+            ;;
+    esac
+done
+
+# Show help if requested
+if [ "$SHOW_HELP" = true ]; then
+    show_help
+fi
+
+# Function to print colored messages
+print_message() {
+    local color=$1
+    local message=$2
+    echo -e "${color}${message}${NC}"
+}
+
+# Function to check git repository
+check_git_repo() {
+    if ! git rev-parse --is-inside-work-tree &> /dev/null; then
+        print_message "$RED" "Error: Not a git repository"
+        exit 1
+    fi
+}
+
+# Function to get staged changes
+get_staged_changes() {
+    git diff --cached --name-status
+}
+
+# Function to get all changes
+get_all_changes() {
+    git diff --name-status
+}
+
+# Function to show staged files
+show_staged_files() {
+    echo -e "${CYAN}Changes to be committed:${NC}"
+    echo "  (use \"git restore --staged <file>...\" to unstage)"
+    echo
+    git diff --cached --name-status | while read -r status file; do
+        case "$status" in
+            M) echo -e "        ${CYAN}modified:   $file${NC}" ;;
+            A) echo -e "        ${CYAN}new file:   $file${NC}" ;;
+            D) echo -e "        ${CYAN}deleted:    $file${NC}" ;;
+            R) echo -e "        ${CYAN}renamed:    $file${NC}" ;;
+            C) echo -e "        ${CYAN}copied:     $file${NC}" ;;
+            *) echo -e "        ${CYAN}changed:    $file${NC}" ;;
+        esac
+    done
+    echo
+}
+
+# Function to show all changed files
+show_all_files() {
+    echo -e "${BLUE}Changed files:${NC}"
+    git diff --name-only | while read -r file; do
+        echo "  - $file"
+    done
+}
+
+# Function to edit commit message
+edit_commit_message() {
+    local message=$1
+    local git_dir=$(git rev-parse --git-dir)
+    echo "$message" > "$git_dir/COMMIT_EDITMSG"
+    
+    # Use /dev/tty to ensure proper terminal interaction
+    ${EDITOR:-vim} "$git_dir/COMMIT_EDITMSG" </dev/tty >/dev/tty
+    local status=$?
+    
+    if [ $status -ne 0 ]; then
+        echo "Aborting commit due to empty commit message or editor exit"
+        return 1
+    fi
+    
+    # Read the edited message and check if it's empty
+    local edited_message=$(cat "$git_dir/COMMIT_EDITMSG")
+    if [ -z "$(echo "$edited_message" | grep -v '^#' | tr -d '[:space:]')" ]; then
+        echo "Aborting commit due to empty commit message"
+        return 1
+    fi
+    
+    echo "$edited_message"
+    return 0
+}
+
+# Function to generate commit message using llm
+generate_commit_message() {
+    local diff_content
+    if [ -n "$(get_staged_changes)" ]; then
+        diff_content=$(git diff --cached)
+    else
+        diff_content=$(git diff)
+    fi
+    
+    # Get current branch name and extract the description part
+    local current_branch=$(git rev-parse --abbrev-ref HEAD)
+    local branch_description=$(echo "$current_branch" | cut -d'/' -f3-)
+    
+    # If previous_commit_messages is set, include them in the prompt
+    local previous_prompt=""
+    if [ -n "$previous_commit_messages" ]; then
+        previous_prompt="[REGENERATION REQUEST] The following commit messages were already suggested and not accepted:\n"
+        IFS=$'\n'
+        local count=1
+        for msg in $previous_commit_messages; do
+            previous_prompt+="$count. ---\n$msg\n---\n"
+            ((count++))
+        done
+        previous_prompt+="\nYou MUST generate a SIGNIFICANTLY DIFFERENT commit message that:\n"
+        previous_prompt+="1. Uses different key terms and phrases\n"
+        previous_prompt+="2. Focuses on a different aspect of the changes\n"
+        previous_prompt+="3. Takes a different perspective (e.g. technical vs. user impact)\n"
+        previous_prompt+="4. Uses different verbs and sentence structures\n"
+        previous_prompt+="DO NOT reuse any significant words or phrases from previous messages unless absolutely necessary.\n\n"
+    fi
+    
+    local prompt="${previous_prompt}Generate a concise and descriptive git commit message for the following changes. The branch name is '${current_branch}' and the feature description is '${branch_description}':\n\n$diff_content"
+    
+    # Generate commit message using llm
+    "$SCRIPT_DIR/git-assist-llm" --scenario commit "$prompt"
+}
+
+# Function to handle amend operation
+handle_amend() {
+    local old_message=$(git log -1 --pretty=%B)
+    local diff_content=$(git diff --cached)
+    
+    if [ -z "$diff_content" ]; then
+        diff_content=$(git show -1 --pretty="" --patch)
+    fi
+    
+    local prompt="Current commit message:\n$old_message\n\nGenerate an improved commit message for these changes:\n\n$diff_content"
+    
+    # Generate new commit message using llm
+    "$SCRIPT_DIR/git-assist-llm" --scenario commit "$prompt"
+}
+
+# Main script
+main() {
+    check_git_repo
+    
+    # Get git directory path early
+    local git_dir=$(git rev-parse --git-dir)
+    
+    if [ "$AMEND" = true ]; then
+        if [ "$MSG_ONLY" = true ]; then
+            handle_amend
+            exit 0
+        fi
+        
+        printf "Generating improved commit message..."
+        commit_message=$(handle_amend)
+        printf "\rImproved commit message:           \n"
+        echo -e "\n${CYAN}    $commit_message${NC}\n"
+        echo -n "Use this message? (Y/n/[e]dit): "
+        read -r choice
+        
+        case "$choice" in
+            [Nn]*)
+                exit 0
+                ;;
+            [Ee]*)
+                commit_message=$(edit_commit_message "$commit_message")
+                git commit --amend -m "$commit_message"
+                echo "Commit message amended successfully!"
+                ;;
+            *)
+                git commit --amend -m "$commit_message"
+                echo "Commit message amended successfully!"
+                ;;
+        esac
+        
+        exit 0
+    fi
+    
+    # Handle msg-only mode
+    if [ "$MSG_ONLY" = true ]; then
+        generate_commit_message
+        exit 0
+    fi
+    
+    # Check if there are staged changes
+    if [ -z "$(get_staged_changes)" ]; then
+        # First check if there are any unstaged changes before asking to stage them
+        if [ -z "$(get_all_changes)" ] && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            print_message "$RED" "No changes to commit"
+            exit 1
+        fi
+        
+        echo -n "No staged changes found. Would you like to stage all changes? (y/N) "
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            git add .
+            if [ -z "$(get_staged_changes)" ]; then
+                print_message "$RED" "No changes to commit"
+                exit 1
+            fi
+        else
+            print_message "$RED" "No changes staged for commit"
+            exit 1
+        fi
+    fi
+    
+    # Show staged files
+    show_staged_files
+    echo -n "Commit the changes above and generate message? (Y/n): "
+    read -r proceed
+    if [[ "$proceed" =~ ^[Nn]$ ]]; then
+        exit 0
+    fi
+    
+    # Generate commit message
+    printf "Generating commit message..."
+    commit_message=$(generate_commit_message)
+    printf "\rGenerated commit message:           \n"
+    echo -e "\n${CYAN}    $commit_message${NC}\n"
+    
+    while true; do
+        echo -n "Use this message? (Y/n/[e]dit/[r]egenerate): "
+        read -r choice
+        
+        case "$choice" in
+            [Nn]*)
+                exit 0
+                ;;
+            [Rr]*)
+                printf "Generating new message..."
+                commit_message=$(generate_commit_message)
+                printf "\rGenerated message:           \n"
+                echo -e "\n${CYAN}    $commit_message${NC}\n"
+                ;;
+            [Ee]*)
+                if ! commit_message=$(edit_commit_message "$commit_message"); then
+                    exit 1
+                fi
+                git commit -m "$commit_message"
+                echo "Changes committed successfully!"
+                exit 0
+                ;;
+            *)
+                git commit -m "$commit_message"
+                echo "Changes committed successfully!"
+                exit 0
+                ;;
+        esac
+    done
+}
+
+# Initialize prompts if needed
+"$SCRIPT_DIR/git-assist-prompt" --init commit
+
+main 

@@ -1,0 +1,12 @@
+# Test repositories
+test/repos/
+
+# Node modules (for test projects created by create-vite)
+node_modules/
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/ 
+cfg
+dist/
